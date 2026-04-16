@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Bomber Admin Panel</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body { font-family: Arial; margin: 20px; background: #1a1a1a; color: #fff; }
+        .card { background: #2a2a2a; padding: 20px; margin: 10px 0; border-radius: 10px; }
+        button { background: #ff4444; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>🎛️ Bomber Admin Panel</h1>
+    
+    <div class="card">
+        <h3>📊 Live Stats</h3>
+        <p>Active Attacks: <strong>{{ active }}</strong></p>
+        <button onclick="refreshStats()">🔄 Refresh</button>
+    </div>
+    
+    <div class="card">
+        <h3>📈 Attack History</h3>
+        <div id="chart"></div>
+    </div>
+    
+    <script>
+        async function refreshStats() {
+            const res = await fetch('/health');
+            const data = await res.json();
+            document.querySelector('strong').textContent = data.active_attacks;
+        }
+        
+        // Live chart update
+        setInterval(refreshStats, 5000);
+    </script>
+</body>
+</html>
